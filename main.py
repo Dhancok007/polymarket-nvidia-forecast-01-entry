@@ -1,44 +1,46 @@
 import json, math, os, sys
 
-# Forecaster for Polymarket "Next CEO of NVIDIA?" minute prices.
-# Base: ensemble of absolute-space and logit-space forecasts. Per-market
-# volatility = EWMA (halflife 720 min) of mean absolute 1-minute changes;
-# the shape of future moves is the pooled empirical quantiles of
-# standardised h-minute changes from the case itself (per horizon bucket),
-# outer multipliers shrunk (CAL) and spread scaled by 0.7.
-# Round-2 additions, all operating on the ensemble output:
-#  - a second ensemble pass with a faster vol halflife (300 min), blended
-#    in at weight 0.25;
-#  - 10% blend toward the house baseline rows (a spread floor);
-#  - horizon-bucket tail shaping: at longer horizons the inner/outer
-#    quantiles are pulled toward the median (the raw ensemble over-covers
-#    there: coverage90 0.93-0.95 vs 0.90 nominal);
-#  - per-market recent-volatility boost: markets whose last 90 minutes were
-#    much more active than their EWMA level get a wider spread (news moves
-#    cluster), capped at 2x.
-# Final entry for the competition: the round-2 model above replaces the
-# round-1 ensemble (dev loss 0.275417) after beating it on every local
-# validation set (practice, extra, and the equal-weighted mean of both).
+# Forecaster v3 for Polymarket "Next CEO of NVIDIA?" minute prices.
+# Same ensemble skeleton as candidate2 (absolute + logit space, EWMA
+# mean-abs vol, pooled empirical quantiles of standardised changes,
+# fast-pass blend, baseline blend, horizon tail shaping, rvol boost),
+# with a rebuilt quantile-table stage and retuned constants:
+#  - table samples are drawn only from the last RECENT=2160 minutes of
+#    each history (older regimes, including the market-open price
+#    discovery, no longer contaminate the tails);
+#  - standardised samples are winsorized at +-10 before quantiles are
+#    taken (one-off repricing crashes reached -1200 sigma raw);
+#  - spread squeezed (SCALE 0.65, CAL (.5,.9,1,.9,.5), stronger tail
+#    shaping) to bring 90% coverage from ~0.94 toward ~0.92;
+#  - vol halflife 540 and fast-pass weight 0.35.
+# Tested and rejected this round: per-market tables shrunk to pooled,
+# vol-state conditioned scaling, robust-center (TWAP/median) shifts.
+# Final entry: this v3 model replaces candidate2 (official dev loss
+# 0.271305, coverage_90 0.9448 flagged by the platform) after beating it
+# on practice, extra, late-extra, and the equal-weighted mean locally.
 
 BUCKETS = (10, 20, 40, 80, 160, 240)
 TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
-CAL = (0.55, 0.95, 1.0, 0.95, 0.55)
-SCALE = 0.7
-HALFLIFE = 720.0
+CAL = (0.5, 0.9, 1.0, 0.9, 0.5)
+SCALE = 0.65
+HALFLIFE = 540.0
 HL_FAST = 300.0
-W_FAST = 0.25
+W_FAST = 0.35
 BLEND_BASE = 0.1
 EPS = 0.0005
 ZNORM = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
 # per horizon bucket (1-60, 61-120, 121-180, 181-240): multipliers on
 # (q_j - median) for j = 0..4
 SHAPE_G = ((1.0, 1.0, 1.0, 1.0, 1.0),
-           (0.85, 0.94, 1.0, 0.94, 0.85),
-           (0.78, 0.92, 1.0, 0.92, 0.78),
-           (0.81, 0.93, 1.0, 0.93, 0.81))
+           (0.82, 0.93, 1.0, 0.93, 0.82),
+           (0.75, 0.91, 1.0, 0.91, 0.75),
+           (0.78, 0.92, 1.0, 0.92, 0.78))
 RVOL_BETA = 0.3
 RVOL_WIN = 90
 RVOL_CAP = 2.0
+RECENT = 2160        # table samples only from the last RECENT minutes of history
+WINSOR = 10.0        # clip standardised samples to +-WINSOR when building tables
+SHRINK_K = 0.0       # per-market table shrinkage toward pooled (0 = pooled only; tested, no gain)
 
 
 def clamp6(v):
@@ -71,24 +73,50 @@ def quantile(sorted_vals, tau):
 
 
 def std_quantiles(histories, vols):
-    """Pooled empirical quantiles of standardised changes, per horizon bucket."""
-    per_bucket = {H: [] for H in BUCKETS}
+    """Per-market quantile tables of standardised changes, per horizon
+    bucket. Samples come from the last RECENT minutes of each history,
+    are winsorized at +-WINSOR, and each market's own quantiles are
+    shrunk toward the pooled quantiles with weight SHRINK_K."""
+    pooled = {H: [] for H in BUCKETS}
+    own = []
     for prices, s in zip(histories, vols):
-        if s <= 0:
-            continue
-        n = len(prices)
-        for H in BUCKETS:
-            if n <= H + 1:
-                continue
-            denom = s * math.sqrt(H)
-            for t in range(H, n, 10):
-                per_bucket[H].append((prices[t] - prices[t - H]) / denom)
-    out = {}
-    for H, us in per_bucket.items():
+        per_bucket = {H: [] for H in BUCKETS}
+        if s > 0:
+            n = len(prices)
+            for H in BUCKETS:
+                if n <= H + 1:
+                    continue
+                denom = s * math.sqrt(H)
+                t0 = max(H, n - RECENT) if RECENT else H
+                for t in range(t0, n, 10):
+                    u = (prices[t] - prices[t - H]) / denom
+                    if WINSOR is not None:
+                        u = max(-WINSOR, min(WINSOR, u))
+                    per_bucket[H].append(u)
+                    pooled[H].append(u)
+        own.append(per_bucket)
+    pooled_q = {}
+    for H, us in pooled.items():
         if len(us) < 50:
             continue
         us.sort()
-        out[H] = [quantile(us, tau) * CAL[j] for j, tau in enumerate(TAUS)]
+        pooled_q[H] = [quantile(us, tau) for tau in TAUS]
+    out = []
+    for per_bucket in own:
+        tab = {}
+        for H, us in per_bucket.items():
+            if H not in pooled_q:
+                continue
+            if SHRINK_K and len(us) >= 50:
+                us = sorted(us)
+                qo = [quantile(us, tau) for tau in TAUS]
+                cnt = float(len(us))
+                w = cnt / (cnt + SHRINK_K)
+                tab[H] = [(w * qo[j] + (1.0 - w) * pooled_q[H][j]) * CAL[j]
+                          for j in range(5)]
+            else:
+                tab[H] = [pooled_q[H][j] * CAL[j] for j in range(5)]
+        out.append(tab)
     return out
 
 
@@ -161,16 +189,18 @@ def ensemble_pass(histories, halflife, horizon):
     med_log = pos_log[len(pos_log) // 2] if pos_log else 0.02
     vols_log = [v if v > 0 else med_log for v in vols_log]
     qtab_log = std_quantiles(thist, vols_log)
-    if not qtab and not qtab_log:
+    if not any(qtab) and not any(qtab_log):
         return None
     out = []
     for mi, prices in enumerate(histories):
-        if qtab and qtab_log:
-            rows = ensemble_rows(prices, vols[mi], vols_log[mi], qtab, qtab_log, horizon)
-        elif qtab:
-            rows = forecast_market(prices, vols[mi], qtab, horizon)
+        qt = qtab[mi] if qtab else {}
+        ql = qtab_log[mi] if qtab_log else {}
+        if qt and ql:
+            rows = ensemble_rows(prices, vols[mi], vols_log[mi], qt, ql, horizon)
+        elif qt:
+            rows = forecast_market(prices, vols[mi], qt, horizon)
         else:
-            rl = forecast_market(thist[mi], vols_log[mi], qtab_log, horizon, clamp=False)
+            rl = forecast_market(thist[mi], vols_log[mi], ql, horizon, clamp=False)
             rows = [[clamp6(sigmoid(v)) for v in row] for row in rl]
         for row in rows:
             for j in range(1, 5):
