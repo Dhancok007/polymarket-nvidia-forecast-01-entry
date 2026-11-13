@@ -11,9 +11,10 @@ import json, math, os, sys
 
 BUCKETS = (10, 20, 40, 80, 160, 240)
 TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
-CAL = (0.85, 1.0, 1.0, 1.0, 0.85)
-SCALE = 0.9
-HALFLIFE = 1440.0
+CAL = (0.55, 0.95, 1.0, 0.95, 0.55)
+SCALE = 0.7
+HALFLIFE = 720.0
+EPS = 0.0005
 ZNORM = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
 
 
@@ -68,7 +69,7 @@ def std_quantiles(histories, vols):
     return out
 
 
-def forecast_market(prices, s, qtab, horizon):
+def forecast_market(prices, s, qtab, horizon, clamp=True):
     x = prices[-1]
     s *= SCALE
     Hs = sorted(qtab.keys())
@@ -86,7 +87,31 @@ def forecast_market(prices, s, qtab, horizon):
                     m = [qtab[Hs[i]][j] + (qtab[Hs[i + 1]][j] - qtab[Hs[i]][j]) * f for j in range(5)]
                     break
         sh = s * math.sqrt(h)
-        rows.append([clamp6(x + m[j] * sh) for j in range(5)])
+        if clamp:
+            rows.append([clamp6(x + m[j] * sh) for j in range(5)])
+        else:
+            rows.append([x + m[j] * sh for j in range(5)])
+    return rows
+
+
+def logit(p):
+    p = min(1.0 - EPS, max(EPS, p))
+    return math.log(p / (1.0 - p))
+
+
+def sigmoid(z):
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def ensemble_rows(prices, s_abs, s_log, qtab_abs, qtab_log, horizon):
+    """Average of the absolute-space and logit-space forecasts."""
+    ra = forecast_market(prices, s_abs, qtab_abs, horizon)
+    tp = [logit(p) for p in prices]
+    rl = forecast_market(tp, s_log, qtab_log, horizon, clamp=False)
+    rows = []
+    for k in range(horizon):
+        row = [clamp6((ra[k][j] + sigmoid(rl[k][j])) / 2.0) for j in range(5)]
+        rows.append(row)
     return rows
 
 
@@ -107,10 +132,21 @@ def run_case(case):
     med = pos[len(pos) // 2] if pos else 0.002
     vols = [v if v > 0 else med for v in vols]
     qtab = std_quantiles(histories, vols)
+    thist = [[logit(p) for p in h] for h in histories]
+    vols_log = [volatility(t) for t in thist]
+    pos_log = sorted(v for v in vols_log if v > 0)
+    med_log = pos_log[len(pos_log) // 2] if pos_log else 0.02
+    vols_log = [v if v > 0 else med_log for v in vols_log]
+    qtab_log = std_quantiles(thist, vols_log)
     forecasts = []
-    for m, prices, s in zip(markets, histories, vols):
-        if qtab:
+    for mi, (m, prices, s) in enumerate(zip(markets, histories, vols)):
+        if qtab and qtab_log:
+            rows = ensemble_rows(prices, s, vols_log[mi], qtab, qtab_log, horizon)
+        elif qtab:
             rows = forecast_market(prices, s, qtab, horizon)
+        elif qtab_log:
+            rl = forecast_market(thist[mi], vols_log[mi], qtab_log, horizon, clamp=False)
+            rows = [[clamp6(sigmoid(v)) for v in row] for row in rl]
         else:
             rows = baseline_rows(prices[-1], horizon)
         for row in rows:
